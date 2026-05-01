@@ -21,11 +21,16 @@
 
 ## 快速开始
 
-```bash
-# 下载脚本
-wget -O singbox.sh https://your-server/singbox.sh
+**方式一：一条命令直接运行**
 
-# 运行（需要 root）
+```bash
+bash <(curl -sL https://raw.githubusercontent.com/judy-gotv/singbox/main/singbox.sh)
+```
+
+**方式二：下载后运行**
+
+```bash
+wget -O singbox.sh https://raw.githubusercontent.com/judy-gotv/singbox/main/singbox.sh
 sudo bash singbox.sh
 ```
 
