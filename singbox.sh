@@ -134,11 +134,31 @@ do_install() {
   read -rp "  SOCKS5 端口 [默认 1080]: " s5_port;  s5_port=${s5_port:-1080}
   read -rp "  HTTP   端口 [默认 1081]: " ht_port;  ht_port=${ht_port:-1081}
   blank
-  read -rp "  SOCKS5 用户名 [留空=不启用认证]: " s5_user
-  [[ -n "$s5_user" ]] && read -rsp "  SOCKS5 密码: " s5_pass && blank || s5_pass=""
+
+  # SOCKS5 账号密码（必填，空则重新输入）
+  while true; do
+    read -rp "  SOCKS5 用户名: " s5_user
+    [[ -n "$s5_user" ]] && break
+    warn "用户名不能为空，请重新输入"
+  done
+  while true; do
+    read -rp "  SOCKS5 密码:   " s5_pass
+    [[ -n "$s5_pass" ]] && break
+    warn "密码不能为空，请重新输入"
+  done
   blank
-  read -rp "  HTTP   用户名 [留空=不启用认证]: " ht_user
-  [[ -n "$ht_user" ]] && read -rsp "  HTTP   密码: " ht_pass && blank || ht_pass=""
+
+  # HTTP 账号密码（必填，空则重新输入）
+  while true; do
+    read -rp "  HTTP   用户名: " ht_user
+    [[ -n "$ht_user" ]] && break
+    warn "用户名不能为空，请重新输入"
+  done
+  while true; do
+    read -rp "  HTTP   密码:   " ht_pass
+    [[ -n "$ht_pass" ]] && break
+    warn "密码不能为空，请重新输入"
+  done
   blank
   read -rp "  允许局域网访问? [y/N]: " lan_ans
   [[ "${lan_ans,,}" == "y" ]] && allow_lan=true || allow_lan=false
@@ -151,8 +171,8 @@ do_install() {
 
   # ── 显示确认摘要 ──
   echo -e "  ${BOLD}安装参数确认:${NC}"
-  echo -e "    SOCKS5  127.0.0.1:${W}${s5_port}${NC}  $( [[ -n $s5_user ]] && echo "用户: ${W}${s5_user}${NC}" || echo "${DIM}无认证${NC}" )"
-  echo -e "    HTTP    127.0.0.1:${W}${ht_port}${NC}  $( [[ -n $ht_user ]] && echo "用户: ${W}${ht_user}${NC}" || echo "${DIM}无认证${NC}" )"
+  echo -e "    SOCKS5  127.0.0.1:${W}${s5_port}${NC}  用户: ${W}${s5_user}${NC}  密码: ${W}${s5_pass}${NC}"
+  echo -e "    HTTP    127.0.0.1:${W}${ht_port}${NC}  用户: ${W}${ht_user}${NC}  密码: ${W}${ht_pass}${NC}"
   echo -e "    局域网  $( $allow_lan && echo "${G}开启${NC}" || echo "${DIM}关闭${NC}" )"
   blank
   read -rp "  确认开始安装? [Y/n]: " go
@@ -228,11 +248,8 @@ do_install() {
   _hdr "生成代理配置"
   mkdir -p "$CONFIG_DIR" "$LOG_DIR"
   local listen_addr="127.0.0.1"; $allow_lan && listen_addr="0.0.0.0"
-  local s5_users_json="" ht_users_json=""
-  [[ -n "$s5_user" && -n "$s5_pass" ]] && \
-    s5_users_json='"users":[{"username":"'"$s5_user"'","password":"'"$s5_pass"'"}],'
-  [[ -n "$ht_user" && -n "$ht_pass" ]] && \
-    ht_users_json='"users":[{"username":"'"$ht_user"'","password":"'"$ht_pass"'"}],'
+  local s5_users_json='"users":[{"username":"'"$s5_user"'","password":"'"$s5_pass"'"}],'
+  local ht_users_json='"users":[{"username":"'"$ht_user"'","password":"'"$ht_pass"'"}],'
 
   cat > "$CONFIG_FILE" <<EOF
 {
@@ -321,10 +338,12 @@ EOF
   echo -e "  ${G}╔══════════════════════════════════════════════════════╗${NC}"
   echo -e "  ${G}║${NC}        ${BOLD}${G}sing-box v${version}  安装完成！${NC}              ${G}║${NC}"
   echo -e "  ${G}╠══════════════════════════════════════════════════════╣${NC}"
-  printf   "  ${G}║${NC}  SOCKS5  ${W}%-20s${NC}  %-22s${G}║${NC}\n" \
-           "${server_ip}:${s5_port}" "$( [[ -n $s5_user ]] && echo "用户: $s5_user" || echo "(无认证)" )"
-  printf   "  ${G}║${NC}  HTTP    ${W}%-20s${NC}  %-22s${G}║${NC}\n" \
-           "${server_ip}:${ht_port}" "$( [[ -n $ht_user ]] && echo "用户: $ht_user" || echo "(无认证)" )"
+  printf   "  ${G}║${NC}  SOCKS5  ${W}%-20s${NC}  用户: ${W}%-16s${NC}${G}║${NC}\n" \
+           "${server_ip}:${s5_port}" "${s5_user}"
+  printf   "  ${G}║${NC}          %-20s   密码: ${W}%-16s${NC}${G}║${NC}\n" "" "${s5_pass}"
+  printf   "  ${G}║${NC}  HTTP    ${W}%-20s${NC}  用户: ${W}%-16s${NC}${G}║${NC}\n" \
+           "${server_ip}:${ht_port}" "${ht_user}"
+  printf   "  ${G}║${NC}          %-20s   密码: ${W}%-16s${NC}${G}║${NC}\n" "" "${ht_pass}"
   printf   "  ${G}║${NC}  局域网  %-46s${G}║${NC}\n" \
            "$( $allow_lan && echo "${G}已开启${NC}" || echo "${DIM}已关闭（仅本机）${NC}" )"
   echo -e "  ${G}╚══════════════════════════════════════════════════════╝${NC}"
@@ -597,32 +616,24 @@ test_auth() {
   sep
 
   echo -e "  ${C}▶ SOCKS5${NC}"
-  if [[ -n "$SOCKS5_USER" ]]; then
-    info "用户名: ${W}${SOCKS5_USER}${NC}"
-    printf "    %-30s" "正确凭据 → 应成功"
-    _curl_s5 "$IP_URL" -o /dev/null 2>/dev/null && ok "通过" || fail "失败"
-    printf "    %-30s" "错误凭据 → 应拒绝"
-    local bad; bad=$(curl -sf --max-time 5 --socks5-hostname "127.0.0.1:${SOCKS5_PORT}" \
-      -U "bad:bad" "$IP_URL" -o /dev/null -w "%{http_code}" 2>/dev/null || echo "000")
-    [[ "$bad" == "000" || "$bad" == "407" ]] && ok "已拒绝" || warn "未拒绝 (HTTP ${bad})"
-  else
-    info "${DIM}无认证模式${NC}"
-  fi
+  info "用户名: ${W}${SOCKS5_USER}${NC}  密码: ${W}${SOCKS5_PASS}${NC}"
+  printf "    %-30s" "正确凭据 → 应成功"
+  _curl_s5 "$IP_URL" -o /dev/null 2>/dev/null && ok "通过" || fail "失败"
+  printf "    %-30s" "错误凭据 → 应拒绝"
+  local bad; bad=$(curl -sf --max-time 5 --socks5-hostname "127.0.0.1:${SOCKS5_PORT}" \
+    -U "bad:bad" "$IP_URL" -o /dev/null -w "%{http_code}" 2>/dev/null || echo "000")
+  [[ "$bad" == "000" || "$bad" == "407" ]] && ok "已拒绝" || warn "未拒绝 (HTTP ${bad})"
 
   blank
   echo -e "  ${C}▶ HTTP${NC}"
-  if [[ -n "$HTTP_USER" ]]; then
-    info "用户名: ${W}${HTTP_USER}${NC}"
-    printf "    %-30s" "正确凭据 → 应成功"
-    _curl_ht "$IP_URL" -o /dev/null 2>/dev/null && ok "通过" || fail "失败"
-    printf "    %-30s" "错误凭据 → 应拒绝"
-    local bad2; bad2=$(curl -sf --max-time 5 \
-      --proxy "http://bad:bad@127.0.0.1:${HTTP_PORT}" \
-      "$IP_URL" -o /dev/null -w "%{http_code}" 2>/dev/null || echo "000")
-    [[ "$bad2" == "000" || "$bad2" == "407" ]] && ok "已拒绝" || warn "未拒绝 (HTTP ${bad2})"
-  else
-    info "${DIM}无认证模式${NC}"
-  fi
+  info "用户名: ${W}${HTTP_USER}${NC}  密码: ${W}${HTTP_PASS}${NC}"
+  printf "    %-30s" "正确凭据 → 应成功"
+  _curl_ht "$IP_URL" -o /dev/null 2>/dev/null && ok "通过" || fail "失败"
+  printf "    %-30s" "错误凭据 → 应拒绝"
+  local bad2; bad2=$(curl -sf --max-time 5 \
+    --proxy "http://bad:bad@127.0.0.1:${HTTP_PORT}" \
+    "$IP_URL" -o /dev/null -w "%{http_code}" 2>/dev/null || echo "000")
+  [[ "$bad2" == "000" || "$bad2" == "407" ]] && ok "已拒绝" || warn "未拒绝 (HTTP ${bad2})"
   blank; pause
 }
 
@@ -671,6 +682,179 @@ test_full() {
   echo -e "  ${C}▶ 配置文件${NC}"
   [[ -f "$CONFIG_FILE" ]] && ok "$CONFIG_FILE" || fail "配置文件不存在"
   sep
+  blank; pause
+}
+
+# ══════════════════════════════════════════════════════════════════════
+#  ██  修改配置（端口 / 账号 / 密码）
+# ══════════════════════════════════════════════════════════════════════
+do_edit_config() {
+  need_root
+  [[ ! -f "$CONFIG_FILE" ]] && die "配置文件不存在，请先执行安装（选项 1）"
+
+  print_banner
+  echo -e "  ${BOLD}${C}── 修改代理配置 ──────────────────────────────────────${NC}"
+  blank
+
+  # 读取当前值
+  load_proxy_config
+  local cur_listen
+  cur_listen=$(jq -r '.inbounds[0].listen' "$CONFIG_FILE" 2>/dev/null || echo "127.0.0.1")
+  local cur_allow_lan=false
+  [[ "$cur_listen" == "0.0.0.0" ]] && cur_allow_lan=true
+
+  # 展示当前配置
+  echo -e "  ${BOLD}当前配置:${NC}"
+  printf "    %-22s ${W}%s${NC}\n"  "SOCKS5 端口:"  "$SOCKS5_PORT"
+  printf "    %-22s ${W}%s${NC}\n"  "HTTP   端口:"  "$HTTP_PORT"
+  printf "    %-22s ${W}%s${NC}\n"  "SOCKS5 用户名:" "$SOCKS5_USER"
+  printf "    %-22s ${W}%s${NC}\n"  "HTTP   用户名:" "$HTTP_USER"
+  printf "    %-22s ${W}%s${NC}\n"  "局域网访问:"   "$( $cur_allow_lan && echo '已开启' || echo '已关闭' )"
+  blank
+  sep
+  echo -e "  ${DIM}直接回车保留当前值，输入新值则覆盖；账号密码为必填项${NC}"
+  blank
+
+  # ── SOCKS5 端口 ──
+  printf "  SOCKS5 端口 [当前: ${W}%s${NC}]: " "$SOCKS5_PORT"
+  read -r inp
+  local new_s5_port="${inp:-$SOCKS5_PORT}"
+
+  # ── HTTP 端口 ──
+  printf "  HTTP   端口 [当前: ${W}%s${NC}]: " "$HTTP_PORT"
+  read -r inp
+  local new_ht_port="${inp:-$HTTP_PORT}"
+
+  blank
+
+  # ── SOCKS5 账号（必填，回车保留原值，但不能最终为空）──
+  local new_s5_user new_s5_pass
+  while true; do
+    printf "  SOCKS5 用户名 [当前: ${W}%s${NC}]: " "$SOCKS5_USER"
+    read -r inp
+    new_s5_user="${inp:-$SOCKS5_USER}"
+    [[ -n "$new_s5_user" ]] && break
+    warn "用户名不能为空，请重新输入"
+  done
+  while true; do
+    printf "  SOCKS5 密码   [当前: ${W}%s${NC}]: " "$SOCKS5_PASS"
+    read -r inp
+    new_s5_pass="${inp:-$SOCKS5_PASS}"
+    [[ -n "$new_s5_pass" ]] && break
+    warn "密码不能为空，请重新输入"
+  done
+
+  blank
+
+  # ── HTTP 账号（必填，回车保留原值，但不能最终为空）──
+  local new_ht_user new_ht_pass
+  while true; do
+    printf "  HTTP   用户名 [当前: ${W}%s${NC}]: " "$HTTP_USER"
+    read -r inp
+    new_ht_user="${inp:-$HTTP_USER}"
+    [[ -n "$new_ht_user" ]] && break
+    warn "用户名不能为空，请重新输入"
+  done
+  while true; do
+    printf "  HTTP   密码   [当前: ${W}%s${NC}]: " "$HTTP_PASS"
+    read -r inp
+    new_ht_pass="${inp:-$HTTP_PASS}"
+    [[ -n "$new_ht_pass" ]] && break
+    warn "密码不能为空，请重新输入"
+  done
+
+  blank
+
+  # ── 局域网 ──
+  printf "  允许局域网访问 [当前: ${W}%s${NC}] (y/n 切换，回车保留): " \
+         "$( $cur_allow_lan && echo '已开启' || echo '已关闭' )"
+  read -rn1 lan_inp; echo ""
+  local new_allow_lan=$cur_allow_lan
+  [[ "${lan_inp,,}" == "y" ]] && new_allow_lan=true
+  [[ "${lan_inp,,}" == "n" ]] && new_allow_lan=false
+
+  # ── 端口校验 ──
+  [[ "$new_s5_port" =~ ^[0-9]+$ ]] && (( new_s5_port>=1 && new_s5_port<=65535 )) \
+    || die "SOCKS5 端口无效: $new_s5_port"
+  [[ "$new_ht_port" =~ ^[0-9]+$ ]] && (( new_ht_port>=1 && new_ht_port<=65535 )) \
+    || die "HTTP 端口无效: $new_ht_port"
+  [[ "$new_s5_port" == "$new_ht_port" ]] && die "SOCKS5 与 HTTP 端口不能相同"
+
+  # ── 确认摘要 ──
+  blank; sep
+  echo -e "  ${BOLD}修改预览:${NC}"
+  printf "    %-22s ${Y}%s${NC} → ${G}%s${NC}\n" "SOCKS5 端口:" "$SOCKS5_PORT" "$new_s5_port"
+  printf "    %-22s ${Y}%s${NC} → ${G}%s${NC}\n" "HTTP   端口:" "$HTTP_PORT"   "$new_ht_port"
+  printf "    %-22s ${Y}%s${NC} → ${G}%s${NC}\n" "SOCKS5 用户名:" "$SOCKS5_USER" "$new_s5_user"
+  printf "    %-22s ${Y}%s${NC} → ${G}%s${NC}\n" "SOCKS5 密码:"   "$SOCKS5_PASS" "$new_s5_pass"
+  printf "    %-22s ${Y}%s${NC} → ${G}%s${NC}\n" "HTTP   用户名:" "$HTTP_USER"   "$new_ht_user"
+  printf "    %-22s ${Y}%s${NC} → ${G}%s${NC}\n" "HTTP   密码:"   "$HTTP_PASS"   "$new_ht_pass"
+  printf "    %-22s ${Y}%s${NC} → ${G}%s${NC}\n" "局域网访问:" \
+    "$( $cur_allow_lan && echo '开启' || echo '关闭' )" \
+    "$( $new_allow_lan && echo '开启' || echo '关闭' )"
+  blank
+  read -rp "  确认保存并重启服务? [Y/n]: " go
+  [[ "${go,,}" == "n" ]] && { info "已取消，配置未变更。"; pause; return; }
+
+  # ── 写入新配置 ──
+  local new_listen="127.0.0.1"; $new_allow_lan && new_listen="0.0.0.0"
+  local s5_users_json='"users":[{"username":"'"$new_s5_user"'","password":"'"$new_s5_pass"'"}],'
+  local ht_users_json='"users":[{"username":"'"$new_ht_user"'","password":"'"$new_ht_pass"'"}],'
+
+  cat > "$CONFIG_FILE" <<EOF
+{
+  "log": { "level": "info", "output": "${LOG_FILE}", "timestamp": true },
+  "inbounds": [
+    {
+      "type": "socks", "tag": "socks5-in",
+      "listen": "${new_listen}", "listen_port": ${new_s5_port},
+      ${s5_users_json}
+      "sniff": true, "sniff_override_destination": false, "udp": true
+    },
+    {
+      "type": "http", "tag": "http-in",
+      "listen": "${new_listen}", "listen_port": ${new_ht_port},
+      ${ht_users_json}
+      "sniff": true, "sniff_override_destination": false
+    }
+  ],
+  "outbounds": [
+    { "type": "direct", "tag": "direct" },
+    { "type": "block",  "tag": "block"  }
+  ],
+  "route": {
+    "rules": [{ "geoip": ["private"], "outbound": "direct" }],
+    "final": "direct",
+    "auto_detect_interface": true
+  }
+}
+EOF
+
+  sing-box check -c "$CONFIG_FILE" 2>/dev/null || die "配置校验失败，请检查 $CONFIG_FILE"
+  ok "配置文件已更新"
+
+  spin_start "重启 sing-box 服务"
+  systemctl restart "$SERVICE_NAME" 2>/dev/null; sleep 2
+  spin_stop
+
+  systemctl is-active --quiet "$SERVICE_NAME" \
+    && ok "服务已重启，新配置生效" \
+    || fail "服务重启失败，请运行: journalctl -u ${SERVICE_NAME} -n 20"
+
+  # 防火墙同步
+  if $new_allow_lan; then
+    for port in "$new_s5_port" "$new_ht_port"; do
+      for proto in tcp udp; do
+        command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "active" && \
+          ufw allow "${port}/${proto}" >/dev/null 2>&1
+        command -v firewall-cmd &>/dev/null && firewall-cmd --state &>/dev/null 2>&1 && \
+          firewall-cmd --permanent --add-port="${port}/${proto}" >/dev/null 2>&1
+      done
+    done
+    command -v firewall-cmd &>/dev/null && firewall-cmd --reload >/dev/null 2>&1 || true
+    ok "防火墙端口已同步"
+  fi
+
   blank; pause
 }
 
@@ -819,59 +1003,60 @@ main_menu() {
     blank
 
     echo -e "  ${BOLD}${W}  安装管理${NC}"
-    echo -e "  ${W}  1${NC}  安装 / 重新配置 sing-box"
-    echo -e "  ${W}  2${NC}  升级到最新版本"
-    echo -e "  ${W}  3${NC}  卸载 sing-box"
+    echo -e "  ${W}  1${NC}  安装 sing-box"
+    echo -e "  ${W}  2${NC}  修改端口 / 账号 / 密码"
+    echo -e "  ${W}  3${NC}  升级到最新版本"
+    echo -e "  ${W}  4${NC}  卸载 sing-box"
     blank
 
     echo -e "  ${BOLD}${W}  服务控制${NC}"
-    echo -e "  ${W}  4${NC}  启动服务"
-    echo -e "  ${W}  5${NC}  停止服务"
-    echo -e "  ${W}  6${NC}  重启服务"
-    echo -e "  ${W}  7${NC}  查看服务状态"
+    echo -e "  ${W}  5${NC}  启动服务"
+    echo -e "  ${W}  6${NC}  停止服务"
+    echo -e "  ${W}  7${NC}  重启服务"
+    echo -e "  ${W}  8${NC}  查看服务状态"
     blank
 
     echo -e "  ${BOLD}${W}  代理测试${NC}"
-    echo -e "  ${W}  8${NC}  快速连通性测试        ${DIM}检测代理可用性及出口 IP${NC}"
-    echo -e "  ${W}  9${NC}  延迟基准测试          ${DIM}多目标延迟量化评估${NC}"
-    echo -e "  ${W} 10${NC}  认证配置验证          ${DIM}验证用户名密码是否生效${NC}"
-    echo -e "  ${W} 11${NC}  完整诊断报告          ${DIM}服务/端口/连通/认证全检${NC}"
+    echo -e "  ${W}  9${NC}  快速连通性测试        ${DIM}检测代理可用性及出口 IP${NC}"
+    echo -e "  ${W} 10${NC}  延迟基准测试          ${DIM}多目标延迟量化评估${NC}"
+    echo -e "  ${W} 11${NC}  认证配置验证          ${DIM}验证用户名密码是否生效${NC}"
+    echo -e "  ${W} 12${NC}  完整诊断报告          ${DIM}服务/端口/连通/认证全检${NC}"
     blank
 
     echo -e "  ${BOLD}${W}  其他${NC}"
-    echo -e "  ${W} 12${NC}  查看当前配置文件"
-    echo -e "  ${W} 13${NC}  查看实时日志"
-    # 快捷命令状态标记
+    echo -e "  ${W} 13${NC}  查看当前配置文件"
+    echo -e "  ${W} 14${NC}  查看实时日志"
     if _alias_is_set; then
-      echo -e "  ${W} 14${NC}  快捷命令管理             ${DIM}x / X 命令: ${G}已设置${NC}"
+      echo -e "  ${W} 15${NC}  快捷命令管理             ${DIM}x / X 命令: ${G}已设置${NC}"
     else
-      echo -e "  ${W} 14${NC}  设置快捷命令             ${Y}⚠ 尚未设置，输入 x 或 X 可快速打开${NC}"
+      echo -e "  ${W} 15${NC}  设置快捷命令             ${Y}⚠ 尚未设置，输入 x 或 X 可快速打开${NC}"
     fi
     blank
 
     echo -e "  ${W}  0${NC}  退出"
     blank
     sep
-    printf "  请选择 [0-14]: "
+    printf "  请选择 [0-15]: "
     read -r choice
 
     case "$choice" in
       1)  do_install ;;
-      2)  do_upgrade ;;
-      3)  do_uninstall ;;
-      4)  svc_action start   "启动" ;;
-      5)  svc_action stop    "停止" ;;
-      6)  svc_action restart "重启" ;;
-      7)  do_svc_status ;;
-      8)  print_banner; test_quick ;;
-      9)  print_banner; test_latency ;;
-      10) print_banner; test_auth ;;
-      11) print_banner; test_full ;;
-      12) print_banner; do_view_config ;;
-      13) do_view_log ;;
-      14) do_manage_alias ;;
+      2)  do_edit_config ;;
+      3)  do_upgrade ;;
+      4)  do_uninstall ;;
+      5)  svc_action start   "启动" ;;
+      6)  svc_action stop    "停止" ;;
+      7)  svc_action restart "重启" ;;
+      8)  do_svc_status ;;
+      9)  print_banner; test_quick ;;
+      10) print_banner; test_latency ;;
+      11) print_banner; test_auth ;;
+      12) print_banner; test_full ;;
+      13) print_banner; do_view_config ;;
+      14) do_view_log ;;
+      15) do_manage_alias ;;
       0)  blank; echo -e "  ${DIM}再见。${NC}"; blank; exit 0 ;;
-      *)  warn "无效选项「${choice}」，请输入 0-14"; sleep 1 ;;
+      *)  warn "无效选项「${choice}」，请输入 0-15"; sleep 1 ;;
     esac
   done
 }
