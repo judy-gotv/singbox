@@ -11,7 +11,15 @@ C='\033[0;36m'  M='\033[0;35m'  W='\033[1;37m'  DIM='\033[2m'
 BOLD='\033[1m'  NC='\033[0m'
 
 # ── 常量 ──────────────────────────────────────────────────────────────
-SCRIPT_PATH="$(realpath "$0")"
+# 兼容 bash <(curl ...) 方式运行：$0 为 /dev/stdin 时自动下载到临时文件
+if [[ "$0" == "/dev/stdin" || "$0" == "bash" ]]; then
+  _TMP_SELF=$(mktemp /tmp/singbox_XXXXXX.sh)
+  curl -sL "https://raw.githubusercontent.com/judy-gotv/singbox/main/singbox.sh" -o "$_TMP_SELF"
+  chmod +x "$_TMP_SELF"
+  SCRIPT_PATH="$_TMP_SELF"
+else
+  SCRIPT_PATH="$(realpath "$0")"
+fi
 INSTALL_DIR="/usr/local/bin"
 CONFIG_DIR="/etc/sing-box"
 CONFIG_FILE="${CONFIG_DIR}/config.json"
@@ -859,6 +867,388 @@ EOF
 }
 
 # ══════════════════════════════════════════════════════════════════════
+#  ██  出站节点模块
+# ══════════════════════════════════════════════════════════════════════
+
+# ── 工具：判断是否为 IP（IPv4 / IPv6）──────────────────────────────────
+_is_ip() {
+  local h="$1"
+  [[ "$h" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && return 0
+  [[ "$h" =~ ^\[?[0-9a-fA-F:]+\]?$           ]] && return 0
+  return 1
+}
+
+# ── 工具：用 jq 写入出站并更新路由 ─────────────────────────────────────
+_apply_outbound() {
+  local json="$1" tag="$2"
+  [[ ! -f "$CONFIG_FILE" ]] && die "配置文件不存在，请先安装 sing-box"
+  # 移除同名旧出站，追加新出站，路由指向新出站
+  jq --argjson nb "$json" --arg t "$tag" \
+    '.outbounds = ([.outbounds[] | select(.tag != $t)] + [$nb]) |
+     .route.final = $t' \
+    "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" \
+    && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE" \
+    || die "jq 写入失败"
+  sing-box check -c "$CONFIG_FILE" 2>/dev/null || die "配置校验失败，请检查 $CONFIG_FILE"
+}
+
+_remove_outbound_by_tag() {
+  local tag="$1"
+  jq --arg t "$tag" \
+    '.outbounds = [.outbounds[] | select(.tag != $t)] |
+     .route.final = "direct"' \
+    "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" \
+    && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+}
+
+_restart_service() {
+  spin_start "重启 sing-box"
+  systemctl restart "$SERVICE_NAME" 2>/dev/null; sleep 2
+  spin_stop
+  systemctl is-active --quiet "$SERVICE_NAME" \
+    && ok "服务已重启，节点配置已生效" \
+    || fail "服务启动失败，请检查: journalctl -u ${SERVICE_NAME} -n 20"
+}
+
+# ── 获取本地代理地址 ────────────────────────────────────────────────────
+do_get_proxy_addr() {
+  [[ ! -f "$CONFIG_FILE" ]] && die "配置文件不存在，请先安装 sing-box"
+  load_proxy_config
+  local server_ip
+  server_ip=$(curl -sf --max-time 5 https://ifconfig.me 2>/dev/null \
+              || curl -sf --max-time 5 https://api.ipify.org 2>/dev/null \
+              || hostname -I | awk '{print $1}')
+  local listen
+  listen=$(jq -r '.inbounds[0].listen' "$CONFIG_FILE" 2>/dev/null || echo "127.0.0.1")
+  [[ "$listen" == "0.0.0.0" ]] && local addr="$server_ip" || local addr="127.0.0.1"
+
+  # 出站节点信息
+  local proxy_tag proxy_type proxy_server proxy_port
+  proxy_tag=$(jq -r '.route.final' "$CONFIG_FILE" 2>/dev/null || echo "direct")
+  if [[ "$proxy_tag" != "direct" && "$proxy_tag" != "block" ]]; then
+    proxy_type=$(jq -r --arg t "$proxy_tag" '.outbounds[] | select(.tag==$t) | .type' "$CONFIG_FILE" 2>/dev/null)
+    proxy_server=$(jq -r --arg t "$proxy_tag" '.outbounds[] | select(.tag==$t) | .server' "$CONFIG_FILE" 2>/dev/null)
+    proxy_port=$(jq -r --arg t "$proxy_tag" '.outbounds[] | select(.tag==$t) | .server_port' "$CONFIG_FILE" 2>/dev/null)
+  fi
+
+  blank
+  echo -e "  ${G}╔══════════════════════════════════════════════════════╗${NC}"
+  echo -e "  ${G}║${NC}           ${BOLD}本地代理地址${NC}                             ${G}║${NC}"
+  echo -e "  ${G}╠══════════════════════════════════════════════════════╣${NC}"
+  printf   "  ${G}║${NC}  ${C}SOCKS5${NC}  ${W}%-22s${NC}  %-20s${G}║${NC}\n" \
+           "${addr}:${SOCKS5_PORT}" "用户: ${SOCKS5_USER}"
+  printf   "  ${G}║${NC}          %-44s${G}║${NC}\n" "密码: ${SOCKS5_PASS}"
+  echo -e  "  ${G}║${NC}                                                      ${G}║${NC}"
+  printf   "  ${G}║${NC}  ${C}HTTP  ${NC}  ${W}%-22s${NC}  %-20s${G}║${NC}\n" \
+           "${addr}:${HTTP_PORT}" "用户: ${HTTP_USER}"
+  printf   "  ${G}║${NC}          %-44s${G}║${NC}\n" "密码: ${HTTP_PASS}"
+  echo -e  "  ${G}╠══════════════════════════════════════════════════════╣${NC}"
+  if [[ "${proxy_tag:-direct}" != "direct" ]]; then
+    printf "  ${G}║${NC}  ${M}出站节点${NC}  %-43s${G}║${NC}\n" "${proxy_type^^}  ${proxy_server}:${proxy_port}"
+  else
+    printf "  ${G}║${NC}  ${DIM}出站节点  直连（无上游代理）%-24s${NC}${G}║${NC}\n" ""
+  fi
+  echo -e  "  ${G}╚══════════════════════════════════════════════════════╝${NC}"
+  blank
+
+  # curl 命令示例
+  echo -e "  ${BOLD}curl 验证示例:${NC}"
+  echo -e "  ${DIM}# SOCKS5${NC}"
+  echo -e "  curl --socks5 ${SOCKS5_USER}:${SOCKS5_PASS}@${addr}:${SOCKS5_PORT} https://ifconfig.me"
+  blank
+  echo -e "  ${DIM}# HTTP${NC}"
+  echo -e "  curl --proxy http://${HTTP_USER}:${HTTP_PASS}@${addr}:${HTTP_PORT} https://ifconfig.me"
+  blank
+  pause
+}
+
+# ── 添加 Hysteria2 ──────────────────────────────────────────────────────
+do_add_hysteria2() {
+  need_root
+  [[ ! -f "$CONFIG_FILE" ]] && die "请先安装 sing-box（选项 1）"
+  print_banner
+  echo -e "  ${BOLD}${C}── 添加 Hysteria2 出站节点 ───────────────────────────${NC}"
+  blank
+
+  local server port password sni insecure up_mbps down_mbps
+
+  while true; do
+    read -rp "  服务器地址 (IP 或域名): " server
+    [[ -n "$server" ]] && break; warn "不能为空"
+  done
+  while true; do
+    read -rp "  端口 [默认 443]: " port; port=${port:-443}
+    [[ "$port" =~ ^[0-9]+$ ]] && (( port>=1 && port<=65535 )) && break; warn "端口无效"
+  done
+  while true; do
+    read -rp "  密码 (password): " password
+    [[ -n "$password" ]] && break; warn "不能为空"
+  done
+
+  # SNI：有域名自动填入，否则手动输入
+  if _is_ip "$server"; then
+    read -rp "  TLS SNI [留空跳过]: " sni
+  else
+    sni="$server"
+    info "SNI 自动使用域名: ${W}${sni}${NC}"
+  fi
+
+  read -rp "  跳过 TLS 证书验证? [y/N]: " ins
+  [[ "${ins,,}" == "y" ]] && insecure=true || insecure=false
+
+  read -rp "  上行带宽 Mbps [默认 100]: " up_mbps;   up_mbps=${up_mbps:-100}
+  read -rp "  下行带宽 Mbps [默认 100]: " down_mbps; down_mbps=${down_mbps:-100}
+
+  blank; sep
+  echo -e "  ${BOLD}配置预览:${NC}"
+  echo -e "    类型:    Hysteria2"
+  echo -e "    服务器:  ${W}${server}:${port}${NC}"
+  echo -e "    密码:    ${W}${password}${NC}"
+  [[ -n "$sni" ]] && echo -e "    SNI:     ${W}${sni}${NC}"
+  echo -e "    忽略证书: $( $insecure && echo "${Y}是${NC}" || echo "否" )"
+  echo -e "    带宽:    上行 ${W}${up_mbps}Mbps${NC}  下行 ${W}${down_mbps}Mbps${NC}"
+  blank
+  read -rp "  确认添加? [Y/n]: " go
+  [[ "${go,,}" == "n" ]] && { info "已取消"; pause; return; }
+
+  # 构建 JSON
+  local tls_block
+  tls_block=$(jq -n \
+    --argjson ins "$insecure" \
+    --arg sni "$sni" \
+    '{enabled:true, insecure:$ins, server_name:$sni}')
+
+  local out_json
+  out_json=$(jq -n \
+    --arg server "$server" \
+    --argjson port "$port" \
+    --arg pass "$password" \
+    --argjson up "$up_mbps" \
+    --argjson dn "$down_mbps" \
+    --argjson tls "$tls_block" \
+    '{type:"hysteria2",tag:"proxy",server:$server,server_port:$port,
+      password:$pass,up_mbps:$up,down_mbps:$dn,tls:$tls}')
+
+  _apply_outbound "$out_json" "proxy"
+  ok "Hysteria2 节点已写入配置"
+  _restart_service
+  blank; pause
+}
+
+# ── 添加 TUIC ──────────────────────────────────────────────────────────
+do_add_tuic() {
+  need_root
+  [[ ! -f "$CONFIG_FILE" ]] && die "请先安装 sing-box（选项 1）"
+  print_banner
+  echo -e "  ${BOLD}${C}── 添加 TUIC 出站节点 ────────────────────────────────${NC}"
+  blank
+
+  local server port uuid password sni insecure cc
+
+  while true; do
+    read -rp "  服务器地址 (IP 或域名): " server
+    [[ -n "$server" ]] && break; warn "不能为空"
+  done
+  while true; do
+    read -rp "  端口 [默认 443]: " port; port=${port:-443}
+    [[ "$port" =~ ^[0-9]+$ ]] && (( port>=1 && port<=65535 )) && break; warn "端口无效"
+  done
+  while true; do
+    read -rp "  UUID: " uuid
+    [[ -n "$uuid" ]] && break; warn "不能为空"
+  done
+  while true; do
+    read -rp "  密码 (password): " password
+    [[ -n "$password" ]] && break; warn "不能为空"
+  done
+
+  if _is_ip "$server"; then
+    read -rp "  TLS SNI [留空跳过]: " sni
+  else
+    sni="$server"
+    info "SNI 自动使用域名: ${W}${sni}${NC}"
+  fi
+
+  read -rp "  跳过 TLS 证书验证? [y/N]: " ins
+  [[ "${ins,,}" == "y" ]] && insecure=true || insecure=false
+
+  read -rp "  拥塞控制算法 [bbr/cubic/new_reno，默认 bbr]: " cc; cc=${cc:-bbr}
+
+  blank; sep
+  echo -e "  ${BOLD}配置预览:${NC}"
+  echo -e "    类型:    TUIC v5"
+  echo -e "    服务器:  ${W}${server}:${port}${NC}"
+  echo -e "    UUID:    ${W}${uuid}${NC}"
+  echo -e "    密码:    ${W}${password}${NC}"
+  [[ -n "$sni" ]] && echo -e "    SNI:     ${W}${sni}${NC}"
+  echo -e "    拥塞控制: ${W}${cc}${NC}"
+  echo -e "    忽略证书: $( $insecure && echo "${Y}是${NC}" || echo "否" )"
+  blank
+  read -rp "  确认添加? [Y/n]: " go
+  [[ "${go,,}" == "n" ]] && { info "已取消"; pause; return; }
+
+  local tls_block
+  tls_block=$(jq -n \
+    --argjson ins "$insecure" \
+    --arg sni "$sni" \
+    '{enabled:true, insecure:$ins, server_name:$sni}')
+
+  local out_json
+  out_json=$(jq -n \
+    --arg server "$server" \
+    --argjson port "$port" \
+    --arg uuid "$uuid" \
+    --arg pass "$password" \
+    --arg cc "$cc" \
+    --argjson tls "$tls_block" \
+    '{type:"tuic",tag:"proxy",server:$server,server_port:$port,
+      uuid:$uuid,password:$pass,congestion_control:$cc,
+      udp_relay_mode:"native",tls:$tls}')
+
+  _apply_outbound "$out_json" "proxy"
+  ok "TUIC 节点已写入配置"
+  _restart_service
+  blank; pause
+}
+
+# ── 添加 vless+reality ─────────────────────────────────────────────────
+do_add_vless_reality() {
+  need_root
+  [[ ! -f "$CONFIG_FILE" ]] && die "请先安装 sing-box（选项 1）"
+  print_banner
+  echo -e "  ${BOLD}${C}── 添加 vless+reality 出站节点 ───────────────────────${NC}"
+  blank
+
+  local server port uuid flow pubkey shortid sni fp
+
+  while true; do
+    read -rp "  服务器 (域名 或 IP): " server
+    [[ -n "$server" ]] && break; warn "不能为空"
+  done
+  while true; do
+    read -rp "  端口 [默认 443]: " port; port=${port:-443}
+    [[ "$port" =~ ^[0-9]+$ ]] && (( port>=1 && port<=65535 )) && break; warn "端口无效"
+  done
+  while true; do
+    read -rp "  UUID: " uuid
+    [[ -n "$uuid" ]] && break; warn "不能为空"
+  done
+
+  read -rp "  Flow [默认 xtls-rprx-vision]: " flow; flow=${flow:-xtls-rprx-vision}
+
+  while true; do
+    read -rp "  Reality 公钥 (publicKey): " pubkey
+    [[ -n "$pubkey" ]] && break; warn "不能为空"
+  done
+  read -rp "  Short ID [留空则为空]: " shortid
+
+  # SNI：有域名自动填入，否则提示输入（通常填一个真实网站）
+  if _is_ip "$server"; then
+    info "检测到 IP 地址，Reality SNI 需填写伪装域名（如 www.microsoft.com）"
+    while true; do
+      read -rp "  SNI 伪装域名: " sni
+      [[ -n "$sni" ]] && break; warn "不能为空"
+    done
+  else
+    sni="$server"
+    info "SNI 自动使用域名: ${W}${sni}${NC}"
+  fi
+
+  read -rp "  uTLS 指纹 [chrome/firefox/safari/ios，默认 chrome]: " fp
+  fp=${fp:-chrome}
+
+  blank; sep
+  echo -e "  ${BOLD}配置预览:${NC}"
+  echo -e "    类型:    vless + reality"
+  echo -e "    服务器:  ${W}${server}:${port}${NC}"
+  echo -e "    UUID:    ${W}${uuid}${NC}"
+  echo -e "    Flow:    ${W}${flow}${NC}"
+  echo -e "    公钥:    ${W}${pubkey}${NC}"
+  [[ -n "$shortid" ]] && echo -e "    ShortID: ${W}${shortid}${NC}"
+  echo -e "    SNI:     ${W}${sni}${NC}"
+  echo -e "    指纹:    ${W}${fp}${NC}"
+  blank
+  read -rp "  确认添加? [Y/n]: " go
+  [[ "${go,,}" == "n" ]] && { info "已取消"; pause; return; }
+
+  local reality_block
+  reality_block=$(jq -n \
+    --arg pk "$pubkey" \
+    --arg sid "$shortid" \
+    '{enabled:true, public_key:$pk, short_id:$sid}')
+
+  local tls_block
+  tls_block=$(jq -n \
+    --arg sni "$sni" \
+    --arg fp "$fp" \
+    --argjson real "$reality_block" \
+    '{enabled:true, server_name:$sni,
+      utls:{enabled:true, fingerprint:$fp},
+      reality:$real}')
+
+  local out_json
+  out_json=$(jq -n \
+    --arg server "$server" \
+    --argjson port "$port" \
+    --arg uuid "$uuid" \
+    --arg flow "$flow" \
+    --argjson tls "$tls_block" \
+    '{type:"vless",tag:"proxy",server:$server,server_port:$port,
+      uuid:$uuid,flow:$flow,tls:$tls}')
+
+  _apply_outbound "$out_json" "proxy"
+  ok "vless+reality 节点已写入配置"
+  _restart_service
+  blank; pause
+}
+
+# ── 查看 / 删除出站节点 ────────────────────────────────────────────────
+do_manage_outbound() {
+  need_root
+  [[ ! -f "$CONFIG_FILE" ]] && die "配置文件不存在"
+  print_banner
+  echo -e "  ${BOLD}${C}── 出站节点管理 ──────────────────────────────────────${NC}"
+  blank
+
+  local final_tag
+  final_tag=$(jq -r '.route.final' "$CONFIG_FILE" 2>/dev/null || echo "direct")
+
+  if [[ "$final_tag" == "direct" || "$final_tag" == "block" ]]; then
+    warn "当前无上游代理节点（直连模式）"
+    blank; pause; return
+  fi
+
+  local ptype pserver pport
+  ptype=$(jq -r --arg t "$final_tag" '.outbounds[]|select(.tag==$t)|.type' "$CONFIG_FILE")
+  pserver=$(jq -r --arg t "$final_tag" '.outbounds[]|select(.tag==$t)|.server' "$CONFIG_FILE")
+  pport=$(jq -r --arg t "$final_tag" '.outbounds[]|select(.tag==$t)|.server_port' "$CONFIG_FILE")
+
+  ok "当前出站节点:"
+  echo -e "    类型:   ${W}${ptype^^}${NC}"
+  echo -e "    服务器: ${W}${pserver}:${pport}${NC}"
+  blank
+  echo -e "  ${W}1${NC}  删除节点（切换为直连）"
+  echo -e "  ${W}0${NC}  返回"
+  blank; sep
+  printf "  请选择 [0-1]: "
+  read -rn1 sub; echo ""
+
+  case "$sub" in
+    1)
+      read -rp "  确认删除节点并切换为直连? [y/N]: " c
+      if [[ "${c,,}" == "y" ]]; then
+        _remove_outbound_by_tag "$final_tag"
+        ok "节点已删除，已切换为直连"
+        _restart_service
+      else
+        info "已取消"
+      fi
+      sleep 1 ;;
+  esac
+  pause
+}
+
+# ══════════════════════════════════════════════════════════════════════
 #  ██  配置查看
 # ══════════════════════════════════════════════════════════════════════
 do_view_config() {
@@ -1009,34 +1399,55 @@ main_menu() {
     echo -e "  ${W}  4${NC}  卸载 sing-box"
     blank
 
+    # 出站节点状态
+    local _proxy_tag _proxy_label
+    _proxy_tag=$(jq -r '.route.final' "$CONFIG_FILE" 2>/dev/null || echo "direct")
+    if [[ "$_proxy_tag" != "direct" && "$_proxy_tag" != "block" && -f "$CONFIG_FILE" ]]; then
+      local _ptype _pserver _pport
+      _ptype=$(jq -r --arg t "$_proxy_tag" '.outbounds[]|select(.tag==$t)|.type' "$CONFIG_FILE" 2>/dev/null)
+      _pserver=$(jq -r --arg t "$_proxy_tag" '.outbounds[]|select(.tag==$t)|.server' "$CONFIG_FILE" 2>/dev/null)
+      _pport=$(jq -r --arg t "$_proxy_tag" '.outbounds[]|select(.tag==$t)|.server_port' "$CONFIG_FILE" 2>/dev/null)
+      _proxy_label="${G}已配置${NC} ${DIM}${_ptype^^} ${_pserver}:${_pport}${NC}"
+    else
+      _proxy_label="${DIM}直连（未配置出站节点）${NC}"
+    fi
+
+    echo -e "  ${BOLD}${W}  出站节点${NC}  $_proxy_label"
+    echo -e "  ${W}  5${NC}  获取本地代理地址"
+    echo -e "  ${W}  6${NC}  添加 Hysteria2 节点"
+    echo -e "  ${W}  7${NC}  添加 TUIC 节点"
+    echo -e "  ${W}  8${NC}  添加 vless+reality 节点"
+    echo -e "  ${W}  9${NC}  查看 / 删除出站节点"
+    blank
+
     echo -e "  ${BOLD}${W}  服务控制${NC}"
-    echo -e "  ${W}  5${NC}  启动服务"
-    echo -e "  ${W}  6${NC}  停止服务"
-    echo -e "  ${W}  7${NC}  重启服务"
-    echo -e "  ${W}  8${NC}  查看服务状态"
+    echo -e "  ${W} 10${NC}  启动服务"
+    echo -e "  ${W} 11${NC}  停止服务"
+    echo -e "  ${W} 12${NC}  重启服务"
+    echo -e "  ${W} 13${NC}  查看服务状态"
     blank
 
     echo -e "  ${BOLD}${W}  代理测试${NC}"
-    echo -e "  ${W}  9${NC}  快速连通性测试        ${DIM}检测代理可用性及出口 IP${NC}"
-    echo -e "  ${W} 10${NC}  延迟基准测试          ${DIM}多目标延迟量化评估${NC}"
-    echo -e "  ${W} 11${NC}  认证配置验证          ${DIM}验证用户名密码是否生效${NC}"
-    echo -e "  ${W} 12${NC}  完整诊断报告          ${DIM}服务/端口/连通/认证全检${NC}"
+    echo -e "  ${W} 14${NC}  快速连通性测试        ${DIM}检测代理可用性及出口 IP${NC}"
+    echo -e "  ${W} 15${NC}  延迟基准测试          ${DIM}多目标延迟量化评估${NC}"
+    echo -e "  ${W} 16${NC}  认证配置验证          ${DIM}验证用户名密码是否生效${NC}"
+    echo -e "  ${W} 17${NC}  完整诊断报告          ${DIM}服务/端口/连通/认证全检${NC}"
     blank
 
     echo -e "  ${BOLD}${W}  其他${NC}"
-    echo -e "  ${W} 13${NC}  查看当前配置文件"
-    echo -e "  ${W} 14${NC}  查看实时日志"
+    echo -e "  ${W} 18${NC}  查看当前配置文件"
+    echo -e "  ${W} 19${NC}  查看实时日志"
     if _alias_is_set; then
-      echo -e "  ${W} 15${NC}  快捷命令管理             ${DIM}x / X 命令: ${G}已设置${NC}"
+      echo -e "  ${W} 20${NC}  快捷命令管理             ${DIM}x / X 命令: ${G}已设置${NC}"
     else
-      echo -e "  ${W} 15${NC}  设置快捷命令             ${Y}⚠ 尚未设置，输入 x 或 X 可快速打开${NC}"
+      echo -e "  ${W} 20${NC}  设置快捷命令             ${Y}⚠ 尚未设置，输入 x 或 X 可快速打开${NC}"
     fi
     blank
 
     echo -e "  ${W}  0${NC}  退出"
     blank
     sep
-    printf "  请选择 [0-15]: "
+    printf "  请选择 [0-20]: "
     read -r choice
 
     case "$choice" in
@@ -1044,19 +1455,24 @@ main_menu() {
       2)  do_edit_config ;;
       3)  do_upgrade ;;
       4)  do_uninstall ;;
-      5)  svc_action start   "启动" ;;
-      6)  svc_action stop    "停止" ;;
-      7)  svc_action restart "重启" ;;
-      8)  do_svc_status ;;
-      9)  print_banner; test_quick ;;
-      10) print_banner; test_latency ;;
-      11) print_banner; test_auth ;;
-      12) print_banner; test_full ;;
-      13) print_banner; do_view_config ;;
-      14) do_view_log ;;
-      15) do_manage_alias ;;
+      5)  print_banner; do_get_proxy_addr ;;
+      6)  do_add_hysteria2 ;;
+      7)  do_add_tuic ;;
+      8)  do_add_vless_reality ;;
+      9)  do_manage_outbound ;;
+      10) svc_action start   "启动" ;;
+      11) svc_action stop    "停止" ;;
+      12) svc_action restart "重启" ;;
+      13) do_svc_status ;;
+      14) print_banner; test_quick ;;
+      15) print_banner; test_latency ;;
+      16) print_banner; test_auth ;;
+      17) print_banner; test_full ;;
+      18) print_banner; do_view_config ;;
+      19) do_view_log ;;
+      20) do_manage_alias ;;
       0)  blank; echo -e "  ${DIM}再见。${NC}"; blank; exit 0 ;;
-      *)  warn "无效选项「${choice}」，请输入 0-15"; sleep 1 ;;
+      *)  warn "无效选项「${choice}」，请输入 0-20"; sleep 1 ;;
     esac
   done
 }
