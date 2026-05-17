@@ -27,6 +27,89 @@ LOG_DIR="/var/log/sing-box"
 LOG_FILE="${LOG_DIR}/sing-box.log"
 SERVICE_NAME="sing-box"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+ALIAS_MARKER="/etc/profile.d/singbox-cmd.sh"
+ALIAS_SKIP_FLAG="/etc/sing-box/.alias_skipped"
+CMD_LOWER="/usr/local/bin/x"
+CMD_UPPER="/usr/local/bin/X"
+
+# ══════════════════════════════════════════════════════════════════════
+#  ██  配置生成 / 安全工具
+# ══════════════════════════════════════════════════════════════════════
+# 用 jq 安全生成 base config（入站 SOCKS5 + HTTP），避免拼接注入
+_gen_base_config() {
+  local s5p=$1 htp=$2 s5u=$3 s5pw=$4 htu=$5 htpw=$6 listen=$7 out=$8
+  jq -n \
+    --arg log_out "$LOG_FILE" \
+    --arg listen  "$listen" \
+    --argjson s5p "$s5p" --argjson htp "$htp" \
+    --arg s5u "$s5u" --arg s5pw "$s5pw" \
+    --arg htu "$htu" --arg htpw "$htpw" \
+    '{
+      log: { level:"info", output:$log_out, timestamp:true },
+      inbounds: [
+        { type:"socks", tag:"socks5-in",
+          listen:$listen, listen_port:$s5p,
+          users:[{username:$s5u, password:$s5pw}],
+          sniff:true, sniff_override_destination:false, udp:true },
+        { type:"http", tag:"http-in",
+          listen:$listen, listen_port:$htp,
+          users:[{username:$htu, password:$htpw}],
+          sniff:true, sniff_override_destination:false }
+      ],
+      outbounds: [
+        { type:"direct", tag:"direct" },
+        { type:"block",  tag:"block"  }
+      ],
+      route: {
+        rules:[{ geoip:["private"], outbound:"direct" }],
+        final:"direct", auto_detect_interface:true
+      }
+    }' > "$out"
+}
+
+# 收紧含密码文件的权限
+_secure_perms() {
+  [[ -d "$CONFIG_DIR" ]]  && chmod 700 "$CONFIG_DIR"
+  [[ -f "$CONFIG_FILE" ]] && chmod 600 "$CONFIG_FILE"
+  [[ -d "$LOG_DIR" ]]     && chmod 750 "$LOG_DIR"
+  [[ -f "$LOG_FILE" ]]    && chmod 640 "$LOG_FILE"
+}
+
+# 安装/修改配置前备份
+_backup_config() {
+  [[ -f "$CONFIG_FILE" ]] || return 0
+  local bak="${CONFIG_FILE}.bak.$(date +%Y%m%d_%H%M%S)"
+  cp -p "$CONFIG_FILE" "$bak"
+  echo "$bak"
+}
+
+# 防火墙：放行端口
+_fw_open() {
+  local port=$1 proto=$2
+  if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "active"; then
+    ufw allow "${port}/${proto}" >/dev/null 2>&1
+  elif command -v firewall-cmd &>/dev/null && firewall-cmd --state &>/dev/null 2>&1; then
+    firewall-cmd --permanent --add-port="${port}/${proto}" >/dev/null 2>&1
+    _FW_FD_DIRTY=1
+  fi
+}
+
+# 防火墙：撤销端口
+_fw_close() {
+  local port=$1 proto=$2
+  if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "active"; then
+    ufw delete allow "${port}/${proto}" >/dev/null 2>&1
+  elif command -v firewall-cmd &>/dev/null && firewall-cmd --state &>/dev/null 2>&1; then
+    firewall-cmd --permanent --remove-port="${port}/${proto}" >/dev/null 2>&1
+    _FW_FD_DIRTY=1
+  fi
+}
+
+_fw_reload() {
+  command -v firewall-cmd &>/dev/null && [[ "${_FW_FD_DIRTY:-0}" == "1" ]] && \
+    firewall-cmd --reload >/dev/null 2>&1
+  _FW_FD_DIRTY=0
+}
 
 # ══════════════════════════════════════════════════════════════════════
 #  基础工具
@@ -256,37 +339,12 @@ do_install() {
   _hdr "生成代理配置"
   mkdir -p "$CONFIG_DIR" "$LOG_DIR"
   local listen_addr="127.0.0.1"; $allow_lan && listen_addr="0.0.0.0"
-  local s5_users_json='"users":[{"username":"'"$s5_user"'","password":"'"$s5_pass"'"}],'
-  local ht_users_json='"users":[{"username":"'"$ht_user"'","password":"'"$ht_pass"'"}],'
 
-  cat > "$CONFIG_FILE" <<EOF
-{
-  "log": { "level": "info", "output": "${LOG_FILE}", "timestamp": true },
-  "inbounds": [
-    {
-      "type": "socks", "tag": "socks5-in",
-      "listen": "${listen_addr}", "listen_port": ${s5_port},
-      ${s5_users_json}
-      "sniff": true, "sniff_override_destination": false, "udp": true
-    },
-    {
-      "type": "http", "tag": "http-in",
-      "listen": "${listen_addr}", "listen_port": ${ht_port},
-      ${ht_users_json}
-      "sniff": true, "sniff_override_destination": false
-    }
-  ],
-  "outbounds": [
-    { "type": "direct", "tag": "direct" },
-    { "type": "block",  "tag": "block"  }
-  ],
-  "route": {
-    "rules": [{ "geoip": ["private"], "outbound": "direct" }],
-    "final": "direct",
-    "auto_detect_interface": true
-  }
-}
-EOF
+  _gen_base_config "$s5_port" "$ht_port" \
+    "$s5_user" "$s5_pass" "$ht_user" "$ht_pass" \
+    "$listen_addr" "$CONFIG_FILE"
+
+  _secure_perms
   sing-box check -c "$CONFIG_FILE" 2>/dev/null || die "配置校验失败，请检查 $CONFIG_FILE"
   ok "配置文件已就绪 (已通过语法校验)"
 
@@ -324,16 +382,9 @@ EOF
 
   # ── 防火墙 ──
   if $allow_lan; then
-    for port in "$s5_port" "$ht_port"; do
-      for proto in tcp udp; do
-        if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "active"; then
-          ufw allow "${port}/${proto}" >/dev/null 2>&1
-        elif command -v firewall-cmd &>/dev/null && firewall-cmd --state &>/dev/null 2>&1; then
-          firewall-cmd --permanent --add-port="${port}/${proto}" >/dev/null 2>&1
-          firewall-cmd --reload >/dev/null 2>&1
-        fi
-      done
-    done
+    _fw_open "$s5_port" tcp; _fw_open "$s5_port" udp
+    _fw_open "$ht_port" tcp
+    _fw_reload
     ok "防火墙端口已放行"
   fi
 
@@ -470,19 +521,38 @@ do_uninstall() {
   print_banner
   echo -e "  ${BOLD}${R}── 卸载 sing-box ──────────────────────────────────────${NC}"
   blank
-  warn "此操作将删除 sing-box 二进制、配置文件及服务，不可撤销！"
+  warn "此操作将删除 sing-box 二进制、配置文件、服务、快捷命令"
+  warn "及防火墙规则，不可撤销！"
   blank
   read -rp "  输入 YES 确认卸载: " confirm
   [[ "$confirm" != "YES" ]] && { info "已取消。"; pause; return; }
   blank
+
+  # 防火墙：移除当前监听端口的放行规则
+  if [[ -f "$CONFIG_FILE" ]] && command -v jq &>/dev/null; then
+    local _s5p _htp
+    _s5p=$(jq -r '.inbounds[]|select(.type=="socks")|.listen_port' "$CONFIG_FILE" 2>/dev/null)
+    _htp=$(jq -r '.inbounds[]|select(.type=="http")|.listen_port'  "$CONFIG_FILE" 2>/dev/null)
+    [[ -n "$_s5p" ]] && { _fw_close "$_s5p" tcp; _fw_close "$_s5p" udp; }
+    [[ -n "$_htp" ]] && _fw_close "$_htp" tcp
+    _fw_reload
+    info "已撤销防火墙端口放行"
+  fi
+
   spin_start "停止服务"
   systemctl stop    "$SERVICE_NAME" 2>/dev/null || true
   systemctl disable "$SERVICE_NAME" 2>/dev/null || true
   spin_stop; ok "服务已停止"
+
   rm -f "$SERVICE_FILE"; systemctl daemon-reload
   rm -f "${INSTALL_DIR}/sing-box"
   rm -rf "$CONFIG_DIR" "$LOG_DIR"
+
+  # 清理快捷命令 x / X 及标记
+  rm -f "$CMD_LOWER" "$CMD_UPPER" "$ALIAS_MARKER" "$ALIAS_SKIP_FLAG"
+  ok "快捷命令 x / X 已清理"
   ok "文件已清理"
+
   blank
   echo -e "  ${G}sing-box 已完全卸载。${NC}"
   pause
@@ -804,41 +874,38 @@ do_edit_config() {
   read -rp "  确认保存并重启服务? [Y/n]: " go
   [[ "${go,,}" == "n" ]] && { info "已取消，配置未变更。"; pause; return; }
 
-  # ── 写入新配置 ──
+  # 备份当前配置（用于失败回退）
+  local bak; bak=$(_backup_config)
+  [[ -n "$bak" ]] && info "已备份原配置: ${DIM}${bak}${NC}"
+
+  # ── 写入新配置（保留 outbounds / route）──
   local new_listen="127.0.0.1"; $new_allow_lan && new_listen="0.0.0.0"
-  local s5_users_json='"users":[{"username":"'"$new_s5_user"'","password":"'"$new_s5_pass"'"}],'
-  local ht_users_json='"users":[{"username":"'"$new_ht_user"'","password":"'"$new_ht_pass"'"}],'
 
-  cat > "$CONFIG_FILE" <<EOF
-{
-  "log": { "level": "info", "output": "${LOG_FILE}", "timestamp": true },
-  "inbounds": [
-    {
-      "type": "socks", "tag": "socks5-in",
-      "listen": "${new_listen}", "listen_port": ${new_s5_port},
-      ${s5_users_json}
-      "sniff": true, "sniff_override_destination": false, "udp": true
-    },
-    {
-      "type": "http", "tag": "http-in",
-      "listen": "${new_listen}", "listen_port": ${new_ht_port},
-      ${ht_users_json}
-      "sniff": true, "sniff_override_destination": false
-    }
-  ],
-  "outbounds": [
-    { "type": "direct", "tag": "direct" },
-    { "type": "block",  "tag": "block"  }
-  ],
-  "route": {
-    "rules": [{ "geoip": ["private"], "outbound": "direct" }],
-    "final": "direct",
-    "auto_detect_interface": true
-  }
-}
-EOF
+  local tmp="${CONFIG_FILE}.new"
+  if ! jq \
+      --arg listen "$new_listen" \
+      --argjson s5p "$new_s5_port" --argjson htp "$new_ht_port" \
+      --arg s5u "$new_s5_user" --arg s5pw "$new_s5_pass" \
+      --arg htu "$new_ht_user" --arg htpw "$new_ht_pass" \
+      '.inbounds = [
+        { type:"socks", tag:"socks5-in", listen:$listen, listen_port:$s5p,
+          users:[{username:$s5u, password:$s5pw}],
+          sniff:true, sniff_override_destination:false, udp:true },
+        { type:"http", tag:"http-in", listen:$listen, listen_port:$htp,
+          users:[{username:$htu, password:$htpw}],
+          sniff:true, sniff_override_destination:false }
+      ]' "$CONFIG_FILE" > "$tmp"; then
+    rm -f "$tmp"
+    die "jq 写入失败，原配置未变更"
+  fi
 
-  sing-box check -c "$CONFIG_FILE" 2>/dev/null || die "配置校验失败，请检查 $CONFIG_FILE"
+  if ! sing-box check -c "$tmp" 2>/dev/null; then
+    rm -f "$tmp"
+    die "新配置校验失败，已取消变更"
+  fi
+
+  mv "$tmp" "$CONFIG_FILE"
+  _secure_perms
   ok "配置文件已更新"
 
   spin_start "重启 sing-box 服务"
@@ -849,19 +916,21 @@ EOF
     && ok "服务已重启，新配置生效" \
     || fail "服务重启失败，请运行: journalctl -u ${SERVICE_NAME} -n 20"
 
-  # 防火墙同步
-  if $new_allow_lan; then
-    for port in "$new_s5_port" "$new_ht_port"; do
-      for proto in tcp udp; do
-        command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "active" && \
-          ufw allow "${port}/${proto}" >/dev/null 2>&1
-        command -v firewall-cmd &>/dev/null && firewall-cmd --state &>/dev/null 2>&1 && \
-          firewall-cmd --permanent --add-port="${port}/${proto}" >/dev/null 2>&1
-      done
-    done
-    command -v firewall-cmd &>/dev/null && firewall-cmd --reload >/dev/null 2>&1 || true
-    ok "防火墙端口已同步"
+  # ── 防火墙同步：撤销旧端口、放行新端口 ──
+  # 旧端口撤销（仅当原本是 LAN 模式或端口变化时）
+  if $cur_allow_lan && [[ "$SOCKS5_PORT" != "$new_s5_port" || ! $new_allow_lan ]]; then
+    _fw_close "$SOCKS5_PORT" tcp; _fw_close "$SOCKS5_PORT" udp
   fi
+  if $cur_allow_lan && [[ "$HTTP_PORT" != "$new_ht_port" || ! $new_allow_lan ]]; then
+    _fw_close "$HTTP_PORT" tcp
+  fi
+  # 新端口放行
+  if $new_allow_lan; then
+    _fw_open "$new_s5_port" tcp; _fw_open "$new_s5_port" udp
+    _fw_open "$new_ht_port" tcp
+  fi
+  _fw_reload
+  ok "防火墙规则已同步"
 
   blank; pause
 }
@@ -878,27 +947,73 @@ _is_ip() {
   return 1
 }
 
-# ── 工具：用 jq 写入出站并更新路由 ─────────────────────────────────────
+# ── 工具：用 jq 追加出站并自动激活 ─────────────────────────────────────
+# $1 = 节点 JSON  $2 = tag
 _apply_outbound() {
-  local json="$1" tag="$2"
+  local node_json="$1" tag="$2"
   [[ ! -f "$CONFIG_FILE" ]] && die "配置文件不存在，请先安装 sing-box"
-  # 移除同名旧出站，追加新出站，路由指向新出站
-  jq --argjson nb "$json" --arg t "$tag" \
-    '.outbounds = ([.outbounds[] | select(.tag != $t)] + [$nb]) |
-     .route.final = $t' \
-    "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" \
-    && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE" \
-    || die "jq 写入失败"
-  sing-box check -c "$CONFIG_FILE" 2>/dev/null || die "配置校验失败，请检查 $CONFIG_FILE"
+
+  local bak; bak=$(_backup_config)
+  local tmp="${CONFIG_FILE}.new"
+
+  if ! jq --argjson nb "$node_json" --arg t "$tag" \
+      '.outbounds = ([.outbounds[] | select(.tag != $t)] + [$nb]) |
+       .route.final = $t' \
+      "$CONFIG_FILE" > "$tmp"; then
+    rm -f "$tmp"; die "jq 写入失败"
+  fi
+
+  if ! sing-box check -c "$tmp" 2>/dev/null; then
+    rm -f "$tmp"
+    die "新配置校验失败，原配置已备份: ${bak}"
+  fi
+
+  mv "$tmp" "$CONFIG_FILE"
+  _secure_perms
 }
 
+# 移除指定 tag 的出站，若它是当前激活节点则改为 direct
 _remove_outbound_by_tag() {
   local tag="$1"
-  jq --arg t "$tag" \
-    '.outbounds = [.outbounds[] | select(.tag != $t)] |
-     .route.final = "direct"' \
-    "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" \
-    && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+  local tmp="${CONFIG_FILE}.new"
+
+  if ! jq --arg t "$tag" \
+      '.outbounds = [.outbounds[] | select(.tag != $t)] |
+       (if .route.final == $t then .route.final = "direct" else . end)' \
+      "$CONFIG_FILE" > "$tmp"; then
+    rm -f "$tmp"; die "jq 写入失败"
+  fi
+
+  if ! sing-box check -c "$tmp" 2>/dev/null; then
+    rm -f "$tmp"; die "新配置校验失败"
+  fi
+
+  mv "$tmp" "$CONFIG_FILE"
+  _secure_perms
+}
+
+# 切换激活的出站节点
+_switch_outbound() {
+  local tag="$1"
+  local tmp="${CONFIG_FILE}.new"
+  jq --arg t "$tag" '.route.final = $t' "$CONFIG_FILE" > "$tmp" \
+    && sing-box check -c "$tmp" 2>/dev/null \
+    && mv "$tmp" "$CONFIG_FILE" \
+    && _secure_perms \
+    || { rm -f "$tmp"; die "切换失败"; }
+}
+
+# 列出所有非内置出站（不含 direct/block）
+_list_outbounds() {
+  jq -r '.outbounds[] | select(.tag != "direct" and .tag != "block")
+         | "\(.tag)\t\(.type)\t\(.server // "-"):\(.server_port // "-")"' \
+    "$CONFIG_FILE" 2>/dev/null
+}
+
+# 生成唯一 tag: proxy-{type}-{shortid}
+_gen_tag() {
+  local type="$1"
+  echo "proxy-${type}-$(date +%s | tail -c 5)$(( RANDOM % 1000 ))"
 }
 
 _restart_service() {
@@ -1012,25 +1127,28 @@ do_add_hysteria2() {
   [[ "${go,,}" == "n" ]] && { info "已取消"; pause; return; }
 
   # 构建 JSON
+  local tag; tag=$(_gen_tag hysteria2)
   local tls_block
   tls_block=$(jq -n \
     --argjson ins "$insecure" \
     --arg sni "$sni" \
-    '{enabled:true, insecure:$ins, server_name:$sni}')
+    '{enabled:true, insecure:$ins} +
+     (if $sni == "" then {} else {server_name:$sni} end)')
 
   local out_json
   out_json=$(jq -n \
+    --arg tag "$tag" \
     --arg server "$server" \
     --argjson port "$port" \
     --arg pass "$password" \
     --argjson up "$up_mbps" \
     --argjson dn "$down_mbps" \
     --argjson tls "$tls_block" \
-    '{type:"hysteria2",tag:"proxy",server:$server,server_port:$port,
+    '{type:"hysteria2",tag:$tag,server:$server,server_port:$port,
       password:$pass,up_mbps:$up,down_mbps:$dn,tls:$tls}')
 
-  _apply_outbound "$out_json" "proxy"
-  ok "Hysteria2 节点已写入配置"
+  _apply_outbound "$out_json" "$tag"
+  ok "Hysteria2 节点已添加并激活  ${DIM}(tag: ${tag})${NC}"
   _restart_service
   blank; pause
 }
@@ -1087,26 +1205,29 @@ do_add_tuic() {
   read -rp "  确认添加? [Y/n]: " go
   [[ "${go,,}" == "n" ]] && { info "已取消"; pause; return; }
 
+  local tag; tag=$(_gen_tag tuic)
   local tls_block
   tls_block=$(jq -n \
     --argjson ins "$insecure" \
     --arg sni "$sni" \
-    '{enabled:true, insecure:$ins, server_name:$sni}')
+    '{enabled:true, insecure:$ins} +
+     (if $sni == "" then {} else {server_name:$sni} end)')
 
   local out_json
   out_json=$(jq -n \
+    --arg tag "$tag" \
     --arg server "$server" \
     --argjson port "$port" \
     --arg uuid "$uuid" \
     --arg pass "$password" \
     --arg cc "$cc" \
     --argjson tls "$tls_block" \
-    '{type:"tuic",tag:"proxy",server:$server,server_port:$port,
+    '{type:"tuic",tag:$tag,server:$server,server_port:$port,
       uuid:$uuid,password:$pass,congestion_control:$cc,
       udp_relay_mode:"native",tls:$tls}')
 
-  _apply_outbound "$out_json" "proxy"
-  ok "TUIC 节点已写入配置"
+  _apply_outbound "$out_json" "$tag"
+  ok "TUIC 节点已添加并激活  ${DIM}(tag: ${tag})${NC}"
   _restart_service
   blank; pause
 }
@@ -1171,6 +1292,7 @@ do_add_vless_reality() {
   read -rp "  确认添加? [Y/n]: " go
   [[ "${go,,}" == "n" ]] && { info "已取消"; pause; return; }
 
+  local tag; tag=$(_gen_tag vless)
   local reality_block
   reality_block=$(jq -n \
     --arg pk "$pubkey" \
@@ -1188,21 +1310,22 @@ do_add_vless_reality() {
 
   local out_json
   out_json=$(jq -n \
+    --arg tag "$tag" \
     --arg server "$server" \
     --argjson port "$port" \
     --arg uuid "$uuid" \
     --arg flow "$flow" \
     --argjson tls "$tls_block" \
-    '{type:"vless",tag:"proxy",server:$server,server_port:$port,
+    '{type:"vless",tag:$tag,server:$server,server_port:$port,
       uuid:$uuid,flow:$flow,tls:$tls}')
 
-  _apply_outbound "$out_json" "proxy"
-  ok "vless+reality 节点已写入配置"
+  _apply_outbound "$out_json" "$tag"
+  ok "vless+reality 节点已添加并激活  ${DIM}(tag: ${tag})${NC}"
   _restart_service
   blank; pause
 }
 
-# ── 查看 / 删除出站节点 ────────────────────────────────────────────────
+# ── 多节点管理 ──────────────────────────────────────────────────────────
 do_manage_outbound() {
   need_root
   [[ ! -f "$CONFIG_FILE" ]] && die "配置文件不存在"
@@ -1213,39 +1336,282 @@ do_manage_outbound() {
   local final_tag
   final_tag=$(jq -r '.route.final' "$CONFIG_FILE" 2>/dev/null || echo "direct")
 
-  if [[ "$final_tag" == "direct" || "$final_tag" == "block" ]]; then
-    warn "当前无上游代理节点（直连模式）"
+  # 收集所有非内置出站
+  local -a tags types addrs
+  while IFS=$'\t' read -r tg ty ad; do
+    [[ -z "$tg" ]] && continue
+    tags+=("$tg"); types+=("$ty"); addrs+=("$ad")
+  done < <(_list_outbounds)
+
+  if (( ${#tags[@]} == 0 )); then
+    warn "暂无任何出站节点（当前为直连模式）"
+    info "请先通过菜单 6 / 7 / 8 添加节点"
     blank; pause; return
   fi
 
-  local ptype pserver pport
-  ptype=$(jq -r --arg t "$final_tag" '.outbounds[]|select(.tag==$t)|.type' "$CONFIG_FILE")
-  pserver=$(jq -r --arg t "$final_tag" '.outbounds[]|select(.tag==$t)|.server' "$CONFIG_FILE")
-  pport=$(jq -r --arg t "$final_tag" '.outbounds[]|select(.tag==$t)|.server_port' "$CONFIG_FILE")
-
-  ok "当前出站节点:"
-  echo -e "    类型:   ${W}${ptype^^}${NC}"
-  echo -e "    服务器: ${W}${pserver}:${pport}${NC}"
+  echo -e "  ${BOLD}已配置的出站节点:${NC}"
   blank
-  echo -e "  ${W}1${NC}  删除节点（切换为直连）"
-  echo -e "  ${W}0${NC}  返回"
-  blank; sep
-  printf "  请选择 [0-1]: "
-  read -rn1 sub; echo ""
+  local i n=${#tags[@]} marker
+  for ((i=0; i<n; i++)); do
+    if [[ "${tags[$i]}" == "$final_tag" ]]; then
+      marker="${G}●${NC}"   # 激活
+    else
+      marker="${DIM}○${NC}"
+    fi
+    printf "  %s  ${W}%d${NC}  %-8s  ${DIM}%-26s${NC}  ${DIM}%s${NC}\n" \
+      "$marker" $((i+1)) "${types[$i]^^}" "${addrs[$i]}" "${tags[$i]}"
+  done
+  blank
+  if [[ "$final_tag" == "direct" ]]; then
+    info "当前状态: ${Y}直连（无激活节点）${NC}"
+  fi
 
-  case "$sub" in
-    1)
-      read -rp "  确认删除节点并切换为直连? [y/N]: " c
+  blank; sep
+  echo -e "  ${W}s${NC}  切换激活节点"
+  echo -e "  ${W}d${NC}  删除节点"
+  echo -e "  ${W}r${NC}  切回直连模式"
+  echo -e "  ${W}0${NC}  返回"
+  blank
+  printf "  请选择 [s/d/r/0]: "
+  read -rn1 op; echo ""
+
+  case "${op,,}" in
+    s)
+      read -rp "  输入要激活的节点编号 [1-${n}]: " idx
+      [[ "$idx" =~ ^[0-9]+$ ]] && (( idx>=1 && idx<=n )) || { warn "无效编号"; sleep 1; return; }
+      _switch_outbound "${tags[$((idx-1))]}"
+      ok "已切换激活节点为: ${tags[$((idx-1))]}"
+      _restart_service ;;
+    d)
+      read -rp "  输入要删除的节点编号 [1-${n}]: " idx
+      [[ "$idx" =~ ^[0-9]+$ ]] && (( idx>=1 && idx<=n )) || { warn "无效编号"; sleep 1; return; }
+      local del_tag="${tags[$((idx-1))]}"
+      read -rp "  确认删除节点 ${del_tag}? [y/N]: " c
       if [[ "${c,,}" == "y" ]]; then
-        _remove_outbound_by_tag "$final_tag"
-        ok "节点已删除，已切换为直连"
+        _remove_outbound_by_tag "$del_tag"
+        ok "节点已删除"
         _restart_service
       else
         info "已取消"
-      fi
-      sleep 1 ;;
+      fi ;;
+    r)
+      read -rp "  确认切回直连? [y/N]: " c
+      if [[ "${c,,}" == "y" ]]; then
+        _switch_outbound "direct"
+        ok "已切回直连模式"
+        _restart_service
+      else
+        info "已取消"
+      fi ;;
+    0) return ;;
+    *) warn "无效操作"; sleep 1 ;;
   esac
   pause
+}
+
+# ══════════════════════════════════════════════════════════════════════
+#  ██  配置查看
+# ══════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════
+#  ██  备份 / 恢复
+# ══════════════════════════════════════════════════════════════════════
+BACKUP_DIR="/var/backups/sing-box"
+
+do_backup() {
+  need_root
+  [[ ! -d "$CONFIG_DIR" ]] && die "配置目录不存在，无可备份内容"
+  mkdir -p "$BACKUP_DIR"
+  local ts; ts=$(date +%Y%m%d_%H%M%S)
+  local file="${BACKUP_DIR}/singbox-${ts}.tar.gz"
+  print_banner
+  echo -e "  ${BOLD}${C}── 配置备份 ──────────────────────────────────────────${NC}"
+  blank
+  spin_start "正在打包配置"
+  tar -czf "$file" -C / "etc/sing-box" 2>/dev/null
+  spin_stop
+  chmod 600 "$file"
+  ok "备份完成"
+  info "文件: ${W}${file}${NC}"
+  info "大小: ${DIM}$(du -h "$file" | awk '{print $1}')${NC}"
+  blank
+
+  # 列出现有备份
+  local cnt; cnt=$(ls -1 "$BACKUP_DIR"/singbox-*.tar.gz 2>/dev/null | wc -l)
+  echo -e "  ${BOLD}所有备份（共 ${cnt} 份）:${NC}"
+  ls -lh "$BACKUP_DIR"/singbox-*.tar.gz 2>/dev/null | awk '{printf "    %s  %6s  %s %s %s\n",$NF,$5,$6,$7,$8}' || true
+  blank; pause
+}
+
+do_restore() {
+  need_root
+  print_banner
+  echo -e "  ${BOLD}${C}── 配置恢复 ──────────────────────────────────────────${NC}"
+  blank
+
+  local -a backups=()
+  while IFS= read -r f; do backups+=("$f"); done < <(ls -1t "$BACKUP_DIR"/singbox-*.tar.gz 2>/dev/null)
+
+  if (( ${#backups[@]} == 0 )); then
+    warn "未找到任何备份文件  ${DIM}(${BACKUP_DIR})${NC}"
+    info "请先使用「备份配置」生成备份"
+    blank; pause; return
+  fi
+
+  echo -e "  ${BOLD}可用备份:${NC}"
+  local i n=${#backups[@]}
+  for ((i=0; i<n; i++)); do
+    local fname size mtime
+    fname=$(basename "${backups[$i]}")
+    size=$(du -h "${backups[$i]}" | awk '{print $1}')
+    mtime=$(stat -c %y "${backups[$i]}" 2>/dev/null | cut -d. -f1)
+    printf "    ${W}%d${NC}  %-30s  ${DIM}%s  %s${NC}\n" $((i+1)) "$fname" "$size" "$mtime"
+  done
+  blank
+  read -rp "  选择要恢复的备份编号 [1-${n}, 0=取消]: " idx
+  [[ "$idx" == "0" || -z "$idx" ]] && { info "已取消"; pause; return; }
+  [[ "$idx" =~ ^[0-9]+$ ]] && (( idx>=1 && idx<=n )) || { warn "无效编号"; sleep 1; return; }
+
+  local sel="${backups[$((idx-1))]}"
+  warn "恢复将覆盖当前配置，建议先备份当前配置"
+  read -rp "  输入 YES 确认恢复: " c
+  [[ "$c" != "YES" ]] && { info "已取消"; pause; return; }
+
+  # 先备份当前
+  _backup_config >/dev/null
+  spin_start "停止服务并恢复配置"
+  systemctl stop "$SERVICE_NAME" 2>/dev/null || true
+  tar -xzf "$sel" -C / 2>/dev/null
+  _secure_perms
+  spin_stop
+
+  if sing-box check -c "$CONFIG_FILE" 2>/dev/null; then
+    systemctl start "$SERVICE_NAME"; sleep 2
+    if systemctl is-active --quiet "$SERVICE_NAME"; then
+      ok "恢复完成，服务已启动"
+    else
+      fail "服务启动失败，请检查日志"
+    fi
+  else
+    fail "恢复的配置校验失败"
+  fi
+  blank; pause
+}
+
+# ══════════════════════════════════════════════════════════════════════
+#  ██  订阅链接 / URI 生成
+# ══════════════════════════════════════════════════════════════════════
+# urlencode helper（兼容无 python 环境）
+_urlencode() {
+  local s="$1" out="" c i
+  for ((i=0; i<${#s}; i++)); do
+    c="${s:$i:1}"
+    case "$c" in
+      [a-zA-Z0-9.~_-]) out+="$c" ;;
+      *) out+=$(printf '%%%02X' "'$c") ;;
+    esac
+  done
+  printf '%s' "$out"
+}
+
+do_show_uri() {
+  [[ ! -f "$CONFIG_FILE" ]] && die "配置文件不存在"
+  print_banner
+  echo -e "  ${BOLD}${C}── 订阅链接 / 节点 URI ───────────────────────────────${NC}"
+  blank
+
+  # 提取本地 SOCKS5/HTTP 供本机使用
+  load_proxy_config
+  local server_ip
+  server_ip=$(curl -sf --max-time 5 https://ifconfig.me 2>/dev/null \
+              || hostname -I | awk '{print $1}')
+  local listen
+  listen=$(jq -r '.inbounds[0].listen' "$CONFIG_FILE" 2>/dev/null || echo "127.0.0.1")
+  local local_host="127.0.0.1"
+  [[ "$listen" == "0.0.0.0" ]] && local_host="$server_ip"
+
+  echo -e "  ${BOLD}本地代理 URI:${NC}"
+  echo -e "  ${DIM}# SOCKS5${NC}"
+  echo -e "  ${W}socks5://$(_urlencode "$SOCKS5_USER"):$(_urlencode "$SOCKS5_PASS")@${local_host}:${SOCKS5_PORT}${NC}"
+  blank
+  echo -e "  ${DIM}# HTTP${NC}"
+  echo -e "  ${W}http://$(_urlencode "$HTTP_USER"):$(_urlencode "$HTTP_PASS")@${local_host}:${HTTP_PORT}${NC}"
+  blank; sep
+  blank
+
+  # 列出所有出站节点的客户端导入链接
+  local has_any=false
+  while IFS=$'\t' read -r tag type addr; do
+    [[ -z "$tag" ]] && continue
+    has_any=true
+    local node
+    node=$(jq --arg t "$tag" '.outbounds[] | select(.tag == $t)' "$CONFIG_FILE")
+
+    case "$type" in
+      hysteria2)
+        local h_server h_port h_pass h_sni h_ins
+        h_server=$(echo "$node" | jq -r '.server')
+        h_port=$(echo "$node"   | jq -r '.server_port')
+        h_pass=$(echo "$node"   | jq -r '.password')
+        h_sni=$(echo "$node"    | jq -r '.tls.server_name // ""')
+        h_ins=$(echo "$node"    | jq -r '.tls.insecure // false')
+        local uri="hy2://$(_urlencode "$h_pass")@${h_server}:${h_port}/?"
+        [[ -n "$h_sni" ]] && uri+="sni=${h_sni}&"
+        [[ "$h_ins" == "true" ]] && uri+="insecure=1&"
+        uri+="#${tag}"
+        echo -e "  ${C}▶ Hysteria2${NC}  ${DIM}${tag}${NC}"
+        echo -e "  ${W}${uri}${NC}"
+        blank ;;
+      tuic)
+        local t_server t_port t_uuid t_pass t_sni t_cc t_ins
+        t_server=$(echo "$node" | jq -r '.server')
+        t_port=$(echo "$node"   | jq -r '.server_port')
+        t_uuid=$(echo "$node"   | jq -r '.uuid')
+        t_pass=$(echo "$node"   | jq -r '.password')
+        t_sni=$(echo "$node"    | jq -r '.tls.server_name // ""')
+        t_cc=$(echo "$node"     | jq -r '.congestion_control // "bbr"')
+        t_ins=$(echo "$node"    | jq -r '.tls.insecure // false')
+        local uri="tuic://${t_uuid}:$(_urlencode "$t_pass")@${t_server}:${t_port}/?congestion_control=${t_cc}"
+        [[ -n "$t_sni" ]] && uri+="&sni=${t_sni}"
+        [[ "$t_ins" == "true" ]] && uri+="&allow_insecure=1"
+        uri+="#${tag}"
+        echo -e "  ${C}▶ TUIC${NC}  ${DIM}${tag}${NC}"
+        echo -e "  ${W}${uri}${NC}"
+        blank ;;
+      vless)
+        local v_server v_port v_uuid v_flow v_sni v_pk v_sid v_fp
+        v_server=$(echo "$node" | jq -r '.server')
+        v_port=$(echo "$node"   | jq -r '.server_port')
+        v_uuid=$(echo "$node"   | jq -r '.uuid')
+        v_flow=$(echo "$node"   | jq -r '.flow // ""')
+        v_sni=$(echo "$node"    | jq -r '.tls.server_name // ""')
+        v_pk=$(echo "$node"     | jq -r '.tls.reality.public_key // ""')
+        v_sid=$(echo "$node"    | jq -r '.tls.reality.short_id // ""')
+        v_fp=$(echo "$node"     | jq -r '.tls.utls.fingerprint // "chrome"')
+        local uri="vless://${v_uuid}@${v_server}:${v_port}?encryption=none&security=reality&type=tcp"
+        [[ -n "$v_flow" ]] && uri+="&flow=${v_flow}"
+        [[ -n "$v_sni" ]]  && uri+="&sni=${v_sni}"
+        [[ -n "$v_pk" ]]   && uri+="&pbk=${v_pk}"
+        [[ -n "$v_sid" ]]  && uri+="&sid=${v_sid}"
+        uri+="&fp=${v_fp}#${tag}"
+        echo -e "  ${C}▶ VLESS Reality${NC}  ${DIM}${tag}${NC}"
+        echo -e "  ${W}${uri}${NC}"
+        blank ;;
+    esac
+  done < <(_list_outbounds)
+
+  if ! $has_any; then
+    info "暂无出站节点 URI（仅显示本地代理）"
+    blank
+  fi
+
+  # 二维码（可选）
+  if command -v qrencode &>/dev/null; then
+    info "提示: 终端支持 qrencode，可手动用以下命令生成二维码:"
+    echo -e "  ${DIM}  echo \"链接\" | qrencode -t ANSIUTF8${NC}"
+  else
+    info "${DIM}如需二维码，可安装: apt install qrencode 或 yum install qrencode${NC}"
+  fi
+  blank; pause
 }
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1266,11 +1632,6 @@ do_view_config() {
 # ══════════════════════════════════════════════════════════════════════
 #  ██  快捷命令模块
 # ══════════════════════════════════════════════════════════════════════
-ALIAS_MARKER="/etc/profile.d/singbox-cmd.sh"
-ALIAS_SKIP_FLAG="/etc/sing-box/.alias_skipped"
-CMD_LOWER="/usr/local/bin/x"
-CMD_UPPER="/usr/local/bin/X"
-
 _alias_is_set() {
   [[ -f "$CMD_LOWER" ]] || [[ -f "$CMD_UPPER" ]]
 }
@@ -1400,14 +1761,21 @@ main_menu() {
     blank
 
     # 出站节点状态
-    local _proxy_tag _proxy_label
-    _proxy_tag=$(jq -r '.route.final' "$CONFIG_FILE" 2>/dev/null || echo "direct")
+    local _proxy_tag _proxy_label _nodes_count=0
+    if [[ -f "$CONFIG_FILE" ]] && command -v jq &>/dev/null; then
+      _proxy_tag=$(jq -r '.route.final' "$CONFIG_FILE" 2>/dev/null || echo "direct")
+      _nodes_count=$(jq '[.outbounds[]|select(.tag!="direct" and .tag!="block")]|length' "$CONFIG_FILE" 2>/dev/null || echo 0)
+    else
+      _proxy_tag="direct"
+    fi
     if [[ "$_proxy_tag" != "direct" && "$_proxy_tag" != "block" && -f "$CONFIG_FILE" ]]; then
       local _ptype _pserver _pport
       _ptype=$(jq -r --arg t "$_proxy_tag" '.outbounds[]|select(.tag==$t)|.type' "$CONFIG_FILE" 2>/dev/null)
       _pserver=$(jq -r --arg t "$_proxy_tag" '.outbounds[]|select(.tag==$t)|.server' "$CONFIG_FILE" 2>/dev/null)
       _pport=$(jq -r --arg t "$_proxy_tag" '.outbounds[]|select(.tag==$t)|.server_port' "$CONFIG_FILE" 2>/dev/null)
-      _proxy_label="${G}已配置${NC} ${DIM}${_ptype^^} ${_pserver}:${_pport}${NC}"
+      _proxy_label="${G}● ${_ptype^^} ${_pserver}:${_pport}${NC} ${DIM}(共 ${_nodes_count} 个节点)${NC}"
+    elif (( _nodes_count > 0 )); then
+      _proxy_label="${Y}○ 直连${NC} ${DIM}(已配置 ${_nodes_count} 个节点未激活)${NC}"
     else
       _proxy_label="${DIM}直连（未配置出站节点）${NC}"
     fi
@@ -1417,7 +1785,7 @@ main_menu() {
     echo -e "  ${W}  6${NC}  添加 Hysteria2 节点"
     echo -e "  ${W}  7${NC}  添加 TUIC 节点"
     echo -e "  ${W}  8${NC}  添加 vless+reality 节点"
-    echo -e "  ${W}  9${NC}  查看 / 删除出站节点"
+    echo -e "  ${W}  9${NC}  节点管理（列表 / 切换 / 删除）"
     blank
 
     echo -e "  ${BOLD}${W}  服务控制${NC}"
@@ -1437,17 +1805,20 @@ main_menu() {
     echo -e "  ${BOLD}${W}  其他${NC}"
     echo -e "  ${W} 18${NC}  查看当前配置文件"
     echo -e "  ${W} 19${NC}  查看实时日志"
+    echo -e "  ${W} 20${NC}  导出节点 URI / 订阅链接"
+    echo -e "  ${W} 21${NC}  备份当前配置"
+    echo -e "  ${W} 22${NC}  从备份恢复"
     if _alias_is_set; then
-      echo -e "  ${W} 20${NC}  快捷命令管理             ${DIM}x / X 命令: ${G}已设置${NC}"
+      echo -e "  ${W} 23${NC}  快捷命令管理             ${DIM}x / X 命令: ${G}已设置${NC}"
     else
-      echo -e "  ${W} 20${NC}  设置快捷命令             ${Y}⚠ 尚未设置，输入 x 或 X 可快速打开${NC}"
+      echo -e "  ${W} 23${NC}  设置快捷命令             ${Y}⚠ 尚未设置，输入 x 或 X 可快速打开${NC}"
     fi
     blank
 
     echo -e "  ${W}  0${NC}  退出"
     blank
     sep
-    printf "  请选择 [0-20]: "
+    printf "  请选择 [0-23]: "
     read -r choice
 
     case "$choice" in
@@ -1470,9 +1841,12 @@ main_menu() {
       17) print_banner; test_full ;;
       18) print_banner; do_view_config ;;
       19) do_view_log ;;
-      20) do_manage_alias ;;
+      20) do_show_uri ;;
+      21) do_backup ;;
+      22) do_restore ;;
+      23) do_manage_alias ;;
       0)  blank; echo -e "  ${DIM}再见。${NC}"; blank; exit 0 ;;
-      *)  warn "无效选项「${choice}」，请输入 0-20"; sleep 1 ;;
+      *)  warn "无效选项「${choice}」，请输入 0-23"; sleep 1 ;;
     esac
   done
 }
